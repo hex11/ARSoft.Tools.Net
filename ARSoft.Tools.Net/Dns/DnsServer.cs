@@ -198,174 +198,149 @@ namespace ARSoft.Tools.Net.Dns
 			}
 		}
 
-		private async void HandleUdpListenerAsync()
-		{
-			try
-			{
-				UdpReceiveResult receiveResult;
-				try
-				{
-					receiveResult = await _udpListener.ReceiveAsync();
-				}
-				catch (ObjectDisposedException)
-				{
-					return;
-				}
-				finally
-				{
-					lock (_listenerLock)
-					{
-						_hasActiveUdpListener = false;
-					}
-				}
+        private async void HandleUdpListenerAsync()
+        {
+            try {
+                while (true) {
+                    UdpReceiveResult receiveResult;
+                    try {
+                        receiveResult = await _udpListener.ReceiveAsync();
+                    } catch (ObjectDisposedException) {
+                        return;
+                    } finally {
+                        lock (_listenerLock) {
+                            _hasActiveUdpListener = false;
+                        }
+                    }
 
-				ClientConnectedEventArgs clientConnectedEventArgs = new ClientConnectedEventArgs(ProtocolType.Udp, receiveResult.RemoteEndPoint);
-				await ClientConnected.RaiseAsync(this, clientConnectedEventArgs);
+                    Task.Run(() => HandleUdpMessage(receiveResult));
+                }
+            } catch (Exception ex) {
+                OnExceptionThrownAsync(ex);
+            } finally {
+                lock (_listenerLock)
+                    _availableUdpListener--;
+            }
+        }
 
-				if (clientConnectedEventArgs.RefuseConnect)
-					return;
+        private async Task HandleUdpMessage(UdpReceiveResult receiveResult)
+        {
+            try {
+                ClientConnectedEventArgs clientConnectedEventArgs = new ClientConnectedEventArgs(ProtocolType.Udp, receiveResult.RemoteEndPoint);
+                await ClientConnected.RaiseAsync(this, clientConnectedEventArgs);
 
-				StartUdpListenerTask();
+                if (clientConnectedEventArgs.RefuseConnect)
+                    return;
 
-				byte[] buffer = receiveResult.Buffer;
+                StartUdpListenerTask();
 
-				DnsMessageBase query;
-				byte[] originalMac;
-				try
-				{
-					query = DnsMessageBase.CreateByFlag(buffer, TsigKeySelector, null);
-					originalMac = query.TSigOptions?.Mac;
-				}
-				catch (Exception e)
-				{
-					throw new Exception("Error parsing dns query", e);
-				}
+                byte[] buffer = receiveResult.Buffer;
 
-				DnsMessageBase response;
-				try
-				{
-					response = await ProcessMessageAsync(query, ProtocolType.Udp, receiveResult.RemoteEndPoint);
-				}
-				catch (Exception ex)
-				{
-					OnExceptionThrownAsync(ex);
-					response = null;
-				}
+                DnsMessageBase query;
+                byte[] originalMac;
+                try {
+                    query = DnsMessageBase.CreateByFlag(buffer, TsigKeySelector, null);
+                    originalMac = query.TSigOptions?.Mac;
+                } catch (Exception e) {
+                    throw new Exception("Error parsing dns query", e);
+                }
 
-				if (response == null)
-				{
-					response = query;
-					query.IsQuery = false;
-					query.ReturnCode = ReturnCode.ServerFailure;
-				}
+                DnsMessageBase response;
+                try {
+                    response = await ProcessMessageAsync(query, ProtocolType.Udp, receiveResult.RemoteEndPoint);
+                } catch (Exception ex) {
+                    OnExceptionThrownAsync(ex);
+                    response = null;
+                }
 
-				int length = response.Encode(false, originalMac, out buffer);
+                if (response == null) {
+                    response = query;
+                    query.IsQuery = false;
+                    query.ReturnCode = ReturnCode.ServerFailure;
+                }
 
-				#region Truncating
-				DnsMessage message = response as DnsMessage;
+                int length = response.Encode(false, originalMac, out buffer);
 
-				if (message != null)
-				{
-					int maxLength = 512;
-					if (query.IsEDnsEnabled && message.IsEDnsEnabled)
-					{
-						maxLength = Math.Max(512, (int) message.EDnsOptions.UdpPayloadSize);
-					}
+                #region Truncating
+                DnsMessage message = response as DnsMessage;
 
-					while (length > maxLength)
-					{
-						// First step: remove data from additional records except the opt record
-						if ((message.IsEDnsEnabled && (message.AdditionalRecords.Count > 1)) || (!message.IsEDnsEnabled && (message.AdditionalRecords.Count > 0)))
-						{
-							for (int i = message.AdditionalRecords.Count - 1; i >= 0; i--)
-							{
-								if (message.AdditionalRecords[i].RecordType != RecordType.Opt)
-								{
-									message.AdditionalRecords.RemoveAt(i);
-								}
-							}
+                if (message != null) {
+                    int maxLength = 512;
+                    if (query.IsEDnsEnabled && message.IsEDnsEnabled) {
+                        maxLength = Math.Max(512, (int)message.EDnsOptions.UdpPayloadSize);
+                    }
 
-							length = message.Encode(false, originalMac, out buffer);
-							continue;
-						}
+                    while (length > maxLength) {
+                        // First step: remove data from additional records except the opt record
+                        if ((message.IsEDnsEnabled && (message.AdditionalRecords.Count > 1)) || (!message.IsEDnsEnabled && (message.AdditionalRecords.Count > 0))) {
+                            for (int i = message.AdditionalRecords.Count - 1; i >= 0; i--) {
+                                if (message.AdditionalRecords[i].RecordType != RecordType.Opt) {
+                                    message.AdditionalRecords.RemoveAt(i);
+                                }
+                            }
 
-						int savedLength = 0;
-						if (message.AuthorityRecords.Count > 0)
-						{
-							for (int i = message.AuthorityRecords.Count - 1; i >= 0; i--)
-							{
-								savedLength += message.AuthorityRecords[i].MaximumLength;
-								message.AuthorityRecords.RemoveAt(i);
+                            length = message.Encode(false, originalMac, out buffer);
+                            continue;
+                        }
 
-								if ((length - savedLength) < maxLength)
-								{
-									break;
-								}
-							}
+                        int savedLength = 0;
+                        if (message.AuthorityRecords.Count > 0) {
+                            for (int i = message.AuthorityRecords.Count - 1; i >= 0; i--) {
+                                savedLength += message.AuthorityRecords[i].MaximumLength;
+                                message.AuthorityRecords.RemoveAt(i);
 
-							message.IsTruncated = true;
+                                if ((length - savedLength) < maxLength) {
+                                    break;
+                                }
+                            }
 
-							length = message.Encode(false, originalMac, out buffer);
-							continue;
-						}
+                            message.IsTruncated = true;
 
-						if (message.AnswerRecords.Count > 0)
-						{
-							for (int i = message.AnswerRecords.Count - 1; i >= 0; i--)
-							{
-								savedLength += message.AnswerRecords[i].MaximumLength;
-								message.AnswerRecords.RemoveAt(i);
+                            length = message.Encode(false, originalMac, out buffer);
+                            continue;
+                        }
 
-								if ((length - savedLength) < maxLength)
-								{
-									break;
-								}
-							}
+                        if (message.AnswerRecords.Count > 0) {
+                            for (int i = message.AnswerRecords.Count - 1; i >= 0; i--) {
+                                savedLength += message.AnswerRecords[i].MaximumLength;
+                                message.AnswerRecords.RemoveAt(i);
 
-							message.IsTruncated = true;
+                                if ((length - savedLength) < maxLength) {
+                                    break;
+                                }
+                            }
 
-							length = message.Encode(false, originalMac, out buffer);
-							continue;
-						}
+                            message.IsTruncated = true;
 
-						if (message.Questions.Count > 0)
-						{
-							for (int i = message.Questions.Count - 1; i >= 0; i--)
-							{
-								savedLength += message.Questions[i].MaximumLength;
-								message.Questions.RemoveAt(i);
+                            length = message.Encode(false, originalMac, out buffer);
+                            continue;
+                        }
 
-								if ((length - savedLength) < maxLength)
-								{
-									break;
-								}
-							}
+                        if (message.Questions.Count > 0) {
+                            for (int i = message.Questions.Count - 1; i >= 0; i--) {
+                                savedLength += message.Questions[i].MaximumLength;
+                                message.Questions.RemoveAt(i);
 
-							message.IsTruncated = true;
+                                if ((length - savedLength) < maxLength) {
+                                    break;
+                                }
+                            }
 
-							length = message.Encode(false, originalMac, out buffer);
-						}
-					}
-				}
-				#endregion
+                            message.IsTruncated = true;
 
-				await _udpListener.SendAsync(buffer, length, receiveResult.RemoteEndPoint);
-			}
-			catch (Exception ex)
-			{
-				OnExceptionThrownAsync(ex);
-			}
-			finally
-			{
-				lock (_listenerLock)
-				{
-					_availableUdpListener++;
-				}
-				StartUdpListenerTask();
-			}
-		}
+                            length = message.Encode(false, originalMac, out buffer);
+                        }
+                    }
+                }
+                #endregion
 
-		private void StartTcpListenerTask()
+                await _udpListener.SendAsync(buffer, length, receiveResult.RemoteEndPoint);
+            } catch (Exception ex) {
+                OnExceptionThrownAsync(ex);
+            }
+        }
+
+        private void StartTcpListenerTask()
 		{
 			lock (_listenerLock)
 			{
