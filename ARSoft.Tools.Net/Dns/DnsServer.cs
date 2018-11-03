@@ -232,8 +232,6 @@ namespace ARSoft.Tools.Net.Dns
                 if (clientConnectedEventArgs.RefuseConnect)
                     return;
 
-                StartUdpListenerTask();
-
                 byte[] buffer = receiveResult.Buffer;
 
                 DnsMessageBase query;
